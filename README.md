@@ -6,7 +6,7 @@ MicroServe
 ![GitHub](https://img.shields.io/github/license/edadma/microserve)
 ![Scala Version](https://img.shields.io/badge/Scala-3.8.1-blue.svg)
 
-A lightweight, single-threaded HTTP server for the JVM built on `java.nio`. MicroServe uses a Node.js-style event loop with non-blocking I/O, timers, and a familiar `createServer` API.
+A lightweight, single-threaded HTTP server for the JVM built on `java.nio`. MicroServe uses a Node.js-style event loop with non-blocking I/O, `Future`-based async handlers, HTTP/1.1 keep-alive, and a familiar `createServer` API.
 
 ## Quick Start
 
@@ -38,10 +38,30 @@ import io.github.edadma.microserve.*
   loop.run()
 ```
 
+Handlers return `Future[Unit]` — the response methods (`send`, `sendJson`, `sendHtml`, `end`) return `Future.unit`, so synchronous handlers just work. For async work, use the loop's `ExecutionContext`:
+
+```scala
+import scala.concurrent.Future
+
+val loop = new EventLoop
+given scala.concurrent.ExecutionContext = loop.executionContext
+
+val server = createServer(loop) { (req, res) =>
+  Future {
+    val result = someComputation()
+    res.send(result)
+  }.flatten
+}
+```
+
 ## Features
 
 - Single-threaded, non-blocking I/O via `java.nio` selectors
-- Node.js-style event loop with `nextTick`, `setTimeout`, and `setInterval`
+- Node.js-style event loop with microtask/macrotask separation (`nextTick`, `setImmediate`, `setTimeout`, `setInterval`)
+- `ExecutionContext` for running `Future` callbacks on the event loop thread
+- Ref-counted lifecycle — loop exits automatically when all work is done
+- HTTP/1.1 keep-alive with configurable idle timeouts
+- Graceful shutdown with connection draining
 - Hand-rolled HTTP/1.1 request parser with configurable limits
 - Simple `Request`/`Response` API with helpers for text, HTML, and JSON
 - No external dependencies

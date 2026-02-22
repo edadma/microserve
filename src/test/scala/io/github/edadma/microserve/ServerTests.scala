@@ -113,12 +113,21 @@ class ServerTests extends AnyFreeSpec with Matchers with TestHelper:
   }
 
   "async handler" in {
-    withServer { (req, res) =>
-      given scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+    val loop = new EventLoop
+    given scala.concurrent.ExecutionContext = loop.executionContext
+    val server = createServer(loop) { (req, res) =>
       Future {
         res.send("async hello")
       }.flatten
-    } { (_, _, port) =>
+    }
+    var port = 0
+    server.listen(0) { () => port = server.actualPort }
+    val thread = new Thread(() => loop.run())
+    thread.setDaemon(true)
+    thread.start()
+    Thread.sleep(100)
+
+    try
       val request = HttpRequest.newBuilder()
         .uri(URI.create(s"http://localhost:$port/"))
         .GET()
@@ -126,7 +135,9 @@ class ServerTests extends AnyFreeSpec with Matchers with TestHelper:
       val response = client.send(request, HttpResponse.BodyHandlers.ofString())
       response.statusCode() shouldBe 200
       response.body() shouldBe "async hello"
-    }
+    finally
+      server.close { () => loop.stop() }
+      thread.join(3000)
   }
 
   "async error returns 500" in {
