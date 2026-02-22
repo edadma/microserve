@@ -13,7 +13,7 @@ A lightweight, single-threaded HTTP server for the JVM built on `java.nio`. Micr
 Add to your `build.sbt`:
 
 ```scala
-libraryDependencies += "io.github.edadma" %% "microserve" % "0.1.0"
+libraryDependencies += "io.github.edadma" %% "microserve" % "0.2.0"
 ```
 
 ## Example
@@ -54,14 +54,25 @@ val server = createServer(loop) { (req, res) =>
 }
 ```
 
+## Graceful Shutdown
+
+`server.close()` stops accepting new connections and closes idle keep-alive connections immediately, while letting in-flight requests finish. The drain callback fires once all active requests have completed:
+
+```scala
+server.close { () =>
+  println("All connections drained")
+  loop.stop()
+}
+```
+
 ## Features
 
 - Single-threaded, non-blocking I/O via `java.nio` selectors
 - Node.js-style event loop with microtask/macrotask separation (`nextTick`, `setImmediate`, `setTimeout`, `setInterval`)
 - `ExecutionContext` for running `Future` callbacks on the event loop thread
 - Ref-counted lifecycle — loop exits automatically when all work is done
-- HTTP/1.1 keep-alive with configurable idle timeouts
-- Graceful shutdown with connection draining
+- HTTP/1.1 keep-alive with 30-second idle timeouts
+- Graceful shutdown — in-flight requests complete, idle connections close immediately
 - Hand-rolled HTTP/1.1 request parser with configurable limits
 - Simple `Request`/`Response` API with helpers for text, HTML, and JSON
 - No external dependencies

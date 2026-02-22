@@ -235,6 +235,66 @@ class ServerTests extends AnyFreeSpec with Matchers with TestHelper:
     }
   }
 
+  "graceful shutdown lets in-flight request complete" in {
+    val loop = new EventLoop
+    val server = createServer(loop) { (req, res) =>
+      req.path match
+        case "/slow" =>
+          loop.setTimeout(200) { () =>
+            res.send("delayed response")
+          }
+          Future.unit
+        case _ =>
+          res.send("fast")
+    }
+    var port = 0
+    server.listen(0) { () => port = server.actualPort }
+    val thread = new Thread(() => loop.run())
+    thread.setDaemon(true)
+    thread.start()
+    Thread.sleep(100)
+
+    try
+      // Send the slow request asynchronously
+      val slowFuture = java.util.concurrent.CompletableFuture.supplyAsync { () =>
+        val req = HttpRequest.newBuilder()
+          .uri(URI.create(s"http://localhost:$port/slow"))
+          .GET()
+          .build()
+        client.send(req, HttpResponse.BodyHandlers.ofString())
+      }
+
+      // Give the request time to arrive at the server
+      Thread.sleep(50)
+
+      // Close the server while the request is in flight
+      val drained = new CountDownLatch(1)
+      server.close { () =>
+        drained.countDown()
+        loop.stop()
+      }
+
+      // The in-flight request should complete successfully
+      val response = slowFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
+      response.statusCode() shouldBe 200
+      response.body() shouldBe "delayed response"
+
+      // Server should drain after the response
+      drained.await(5, java.util.concurrent.TimeUnit.SECONDS) shouldBe true
+
+      // New connections should be refused
+      val ex = intercept[Exception] {
+        val req = HttpRequest.newBuilder()
+          .uri(URI.create(s"http://localhost:$port/"))
+          .GET()
+          .build()
+        client.send(req, HttpResponse.BodyHandlers.ofString())
+      }
+      ex should not be null
+    finally
+      thread.join(3000)
+  }
+
   "multiple concurrent connections" in {
     withServer { (req, res) =>
       res.send(s"hello from ${req.path}")

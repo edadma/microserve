@@ -55,8 +55,8 @@ class Server(val loop: EventLoop, handler: RequestHandler):
     catch case _: Exception => ()
     loop.unref() // release server channel ref
 
-    // Force-close all active connections
-    _connections.toList.foreach(_.closeConnection())
+    // Close idle connections; active ones will close after their response
+    _connections.toList.foreach(_.shutdownIfIdle())
 
     if _activeConnections == 0 then
       loop.nextTick(onDrain)
@@ -83,6 +83,7 @@ class Server(val loop: EventLoop, handler: RequestHandler):
     private val parser = new HTTPRequestParser
     private val readBuffer = ByteBuffer.allocate(readBufferSize)
     private var closed = false
+    private var idle = true
     private var idleTimeoutCancel: (() => Unit) = null
 
     resetIdleTimeout()
@@ -133,7 +134,11 @@ class Server(val loop: EventLoop, handler: RequestHandler):
           res.status(400).send(s"Bad Request: ${e.getMessage}")
           closeConnection()
 
+    private[Server] def shutdownIfIdle(): Unit =
+      if idle then closeConnection()
+
     private def processRequest(): Unit =
+      idle = false
       val queryMap = mutable.LinkedHashMap[String, String]()
       parser.query.foreach((k, v) => queryMap(k) = v)
 
@@ -162,6 +167,7 @@ class Server(val loop: EventLoop, handler: RequestHandler):
         httpVersion = httpVer,
         requestConnectionHeader = connHeader,
         onFinish = keepAlive =>
+          idle = true
           if keepAlive && !_closing then
             resetIdleTimeout()
           else
