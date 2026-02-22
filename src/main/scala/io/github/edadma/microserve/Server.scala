@@ -19,6 +19,7 @@ class Server(val loop: EventLoop, handler: RequestHandler):
   private var _activeConnections = 0
   private var _closing = false
   private var _onDrain: Option[() => Unit] = None
+  private val _connections = mutable.Set[ConnectionState]()
 
   private given scala.concurrent.ExecutionContext = loop.executionContext
 
@@ -54,6 +55,9 @@ class Server(val loop: EventLoop, handler: RequestHandler):
     catch case _: Exception => ()
     loop.unref() // release server channel ref
 
+    // Force-close all active connections
+    _connections.toList.foreach(_.closeConnection())
+
     if _activeConnections == 0 then
       loop.nextTick(onDrain)
     else
@@ -70,6 +74,7 @@ class Server(val loop: EventLoop, handler: RequestHandler):
         val selKey = loop.register(client, SelectionKey.OP_READ, null)
         val connState = new ConnectionState(client, selKey)
         selKey.attach(connState)
+        _connections += connState
         connectionOpened()
         loop.ref() // each connection holds a ref
 
@@ -173,10 +178,11 @@ class Server(val loop: EventLoop, handler: RequestHandler):
           closeConnection()
       }
 
-    private def closeConnection(): Unit =
+    private[Server] def closeConnection(): Unit =
       if closed then return
       closed = true
       cancelIdleTimeout()
+      _connections -= this
       selectionKey.cancel()
       try channel.close()
       catch case _: Exception => ()

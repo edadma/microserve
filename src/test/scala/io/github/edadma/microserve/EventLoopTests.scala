@@ -114,3 +114,112 @@ class EventLoopTests extends AnyFreeSpec with Matchers:
     fired shouldBe false
     loop.refCount shouldBe 0
   }
+
+  "nextTick fires before setImmediate" in {
+    val loop = new EventLoop
+    val order = ArrayBuffer[String]()
+
+    loop.ref()
+    loop.setImmediate { () =>
+      order += "immediate"
+      loop.unref()
+    }
+    loop.nextTick { () =>
+      order += "tick"
+    }
+
+    loop.run()
+    order.toSeq shouldBe Seq("tick", "immediate")
+  }
+
+  "nested nextTick drains fully before setTimeout(0)" in {
+    val loop = new EventLoop
+    val order = ArrayBuffer[String]()
+
+    loop.ref()
+    loop.setTimeout(0) { () =>
+      order += "timeout"
+      loop.unref()
+    }
+    loop.nextTick { () =>
+      order += "tick1"
+      loop.nextTick { () =>
+        order += "tick2"
+        loop.nextTick { () =>
+          order += "tick3"
+        }
+      }
+    }
+
+    loop.run()
+    order.toSeq shouldBe Seq("tick1", "tick2", "tick3", "timeout")
+  }
+
+  "setInterval fires multiple times and cancel stops it" in {
+    val loop = new EventLoop
+    val fires = ArrayBuffer[Int]()
+    var count = 0
+
+    val cancel = loop.setInterval(10) { () =>
+      count += 1
+      fires += count
+    }
+
+    loop.setTimeout(80) { () =>
+      cancel()
+    }
+
+    loop.run()
+    fires.size should be >= 3
+    val countAtCancel = fires.size
+
+    // Verify it actually stopped — run a bit more with a short timer
+    loop.ref()
+    loop.setTimeout(50) { () =>
+      loop.unref()
+    }
+    loop.run()
+    fires.size shouldBe countAtCancel
+  }
+
+  "chained Future continuations resolve between macrotasks" in {
+    val loop = new EventLoop
+    given scala.concurrent.ExecutionContext = loop.executionContext
+    val order = ArrayBuffer[String]()
+
+    loop.ref()
+    loop.setTimeout(0) { () =>
+      Future("a").map(_ + "b").map(_ + "c").foreach { result =>
+        order += s"chain=$result"
+      }
+    }
+    loop.setTimeout(0) { () =>
+      order += "timer2"
+      loop.unref()
+    }
+
+    loop.run()
+    order.toSeq shouldBe Seq("chain=abc", "timer2")
+  }
+
+  "cancelled long timer doesn't keep loop alive" in {
+    val loop = new EventLoop
+    var fired = false
+
+    val cancel = loop.setTimeout(1000) { () =>
+      fired = true
+    }
+
+    loop.ref()
+    loop.nextTick { () =>
+      cancel()
+      loop.unref()
+    }
+
+    val start = System.currentTimeMillis()
+    loop.run()
+    val elapsed = System.currentTimeMillis() - start
+
+    fired shouldBe false
+    elapsed should be < 500L
+  }
