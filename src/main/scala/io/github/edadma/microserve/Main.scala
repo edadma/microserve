@@ -32,5 +32,4 @@ package io.github.edadma.microserve
     println("MicroServe listening on http://localhost:3000")
   }
 
-  // This blocks — just like Node's event loop
   loop.run()
