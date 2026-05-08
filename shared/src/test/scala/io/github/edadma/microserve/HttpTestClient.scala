@@ -30,19 +30,11 @@ object HttpTestClient:
     val responsePromise = Promise[TestResponse]()
     val received = scala.collection.mutable.ArrayBuffer.empty[Byte]
 
-    println(s"[client] connect $host:$port")
     runtime.connect(host, port).onComplete {
-      case scala.util.Failure(e) =>
-        println(s"[client] connect failed: $e")
-        responsePromise.failure(e)
+      case scala.util.Failure(e) => responsePromise.failure(e)
       case scala.util.Success(conn) =>
-        println(s"[client] connected")
-        conn.onRead { chunk =>
-          println(s"[client] read ${chunk.length} bytes")
-          received ++= chunk
-        }
+        conn.onRead { chunk => received ++= chunk }
         conn.onClose { () =>
-          println(s"[client] close (received=${received.length})")
           if !responsePromise.isCompleted then
             try responsePromise.success(parse(received.toArray))
             catch case e: Exception => responsePromise.failure(e)

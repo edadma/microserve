@@ -31,26 +31,13 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
     * cleanup runs on success and on failure.
     */
   private def withServer(handler: RequestHandler, port: Int)(test: Int => Future[org.scalatest.Assertion]): Future[org.scalatest.Assertion] =
-    println(s"[withServer] enter port=$port")
     val listening = Promise[Unit]()
     val server = createServer(handler)
-    println(s"[withServer] calling listen")
-    server.listen(port, "127.0.0.1") { () =>
-      println(s"[withServer] listen cb")
-      listening.success(())
-    }
-    println(s"[withServer] listen returned")
+    server.listen(port, "127.0.0.1") { () => listening.success(()) }
 
-    listening.future.flatMap { _ =>
-      println(s"[withServer] flatMap calling test")
-      test(port)
-    }.transformWith { result =>
-      println(s"[withServer] test done, closing")
+    listening.future.flatMap(_ => test(port)).transformWith { result =>
       val drained = Promise[Unit]()
-      server.close { () =>
-        println(s"[withServer] drain cb")
-        drained.success(())
-      }
+      server.close(() => drained.success(()))
       drained.future.transform(_ => result)
     }
 
@@ -59,14 +46,8 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
   private val basePort = 38600
 
   "basic GET returns 200" in {
-    println("[basic] start")
-    withServer({ (req, res) =>
-      println(s"[basic] handler ${req.method} ${req.path}")
-      res.send("hello")
-    }, basePort + 0) { port =>
-      println(s"[basic] body, port=$port")
+    withServer({ (_, res) => res.send("hello") }, basePort + 0) { port =>
       HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
-        println(s"[basic] got resp ${resp.statusCode} ${resp.bodyString}")
         resp.statusCode shouldBe 200
         resp.bodyString shouldBe "hello"
       }

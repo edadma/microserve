@@ -29,14 +29,12 @@ private[microserve] class LibuvServerTransport extends ServerTransport:
   def onAccept(handler: ConnectionTransport => Unit): Unit = acceptHandler = handler
 
   def listen(host: String, port: Int)(onListening: () => Unit): Unit =
-    println(s"[LibuvServerTransport] listen $host:$port")
     val s = defaultLoop.tcp
     server = Some(s)
     s.bind(host, port, 0)
     s.listen(
       128,
       { (handle: TCP, status: Int) =>
-        println(s"[LibuvServerTransport] connection accepted, status=$status")
         if status >= 0 && !closed then
           val client = defaultLoop.tcp
           handle.accept(client)
