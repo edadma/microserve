@@ -3,15 +3,18 @@ import xerial.sbt.Sonatype.sonatypeCentralHost
 ThisBuild / licenses               := Seq("ISC" -> url("https://opensource.org/licenses/ISC"))
 ThisBuild / versionScheme          := Some("semver-spec")
 ThisBuild / evictionErrorLevel     := Level.Warn
-ThisBuild / scalaVersion           := "3.8.1"
+ThisBuild / scalaVersion           := "3.8.3"
 ThisBuild / organization           := "io.github.edadma"
 ThisBuild / organizationName       := "edadma"
 ThisBuild / organizationHomepage   := Some(url("https://github.com/edadma"))
-ThisBuild / version                := "0.2.0"
+ThisBuild / version                := "0.3.0"
+ThisBuild / description            := "A lightweight cross-platform HTTP server for Scala (JVM/JS/Native)"
 ThisBuild / sonatypeCredentialHost := sonatypeCentralHost
 
 ThisBuild / publishConfiguration := publishConfiguration.value.withOverwrite(true).withChecksums(Vector.empty)
 ThisBuild / resolvers += Resolver.mavenLocal
+ThisBuild / resolvers += Resolver.sonatypeCentralSnapshots
+ThisBuild / resolvers += Resolver.sonatypeCentralRepo("releases")
 
 ThisBuild / sonatypeProfileName := "io.github.edadma"
 
@@ -30,20 +33,46 @@ ThisBuild / developers := List(
   ),
 )
 
-ThisBuild / homepage    := Some(url("https://github.com/edadma/microserve"))
-ThisBuild / description := "A lightweight, single-threaded HTTP server for the JVM built on java.nio"
+ThisBuild / homepage := Some(url("https://github.com/edadma/microserve"))
 
 ThisBuild / publishTo := sonatypePublishToBundle.value
 
-name := "microserve"
+lazy val microserve = crossProject(JSPlatform, JVMPlatform, NativePlatform)
+  .in(file("."))
+  .settings(
+    name := "microserve",
+    scalacOptions ++= Seq(
+      "-deprecation",
+      "-feature",
+      "-unchecked",
+      "-language:implicitConversions",
+    ),
+    libraryDependencies += "org.scalatest" %%% "scalatest" % "3.2.19" % Test,
+    publishMavenStyle      := true,
+    Test / publishArtifact := false,
+  )
+  .jvmSettings(
+    // JVM uses java.nio internally — no extra deps.
+  )
+  .jsSettings(
+    jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv(),
+    scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.CommonJSModule) },
+    Test / scalaJSUseMainModuleInitializer := false,
+    Test / scalaJSUseTestModuleInitializer := true,
+    scalaJSUseMainModuleInitializer        := false,
+  )
+  .nativeSettings(
+    libraryDependencies ++= Seq(
+      "io.github.edadma" %%% "libuv" % "0.0.31",
+      "io.github.edadma" %%% "async" % "0.0.17",
+    ),
+  )
 
-scalacOptions ++= Seq(
-  "-deprecation",
-  "-feature",
-  "-unchecked",
-)
-
-libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % Test
-
-publishMavenStyle      := true
-Test / publishArtifact := false
+lazy val root = project
+  .in(file("."))
+  .aggregate(microserve.jvm, microserve.js, microserve.native)
+  .settings(
+    name                := "microserve",
+    publish / skip      := true,
+    publishLocal / skip := true,
+  )
