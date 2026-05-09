@@ -184,4 +184,125 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
         }
     }
   }
+
+  // -- streaming / chunked transfer encoding --------------------------------
+  // These exercise the new `Response.write(chunk)` + `Response.end()` path.
+
+  "streaming response uses chunked transfer encoding" in {
+    withServer(
+      { (_, res) =>
+        res.writeHead(200, Map("Content-Type" -> "text/plain"))
+        res.write("hello ")
+        res.write("world")
+        res.end()
+      },
+      basePort + 11,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.headers.get("Transfer-Encoding") shouldBe Some("chunked")
+        resp.headers.get("Content-Length") shouldBe None
+        resp.bodyString shouldBe "hello world"
+      }
+    }
+  }
+
+  "many small chunks reassemble correctly" in {
+    val n = 50
+    withServer(
+      { (_, res) =>
+        res.writeHead(200)
+        var i = 0
+        while i < n do
+          res.write(s"chunk-$i\n")
+          i += 1
+        res.end()
+      },
+      basePort + 12,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.headers.get("Transfer-Encoding") shouldBe Some("chunked")
+        val expected = (0 until n).map(i => s"chunk-$i\n").mkString
+        resp.bodyString shouldBe expected
+      }
+    }
+  }
+
+  "end(body) in streaming mode emits final chunk + terminator" in {
+    withServer(
+      { (_, res) =>
+        res.writeHead(200)
+        res.write("part1 ")
+        res.end("part2".getBytes("UTF-8"))
+      },
+      basePort + 13,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.headers.get("Transfer-Encoding") shouldBe Some("chunked")
+        resp.bodyString shouldBe "part1 part2"
+      }
+    }
+  }
+
+  "SSE-style event stream with proper content type" in {
+    withServer(
+      { (_, res) =>
+        res.writeHead(200, Map(
+          "Content-Type"  -> "text/event-stream",
+          "Cache-Control" -> "no-cache",
+        ))
+        res.write("event: greet\ndata: hello\n\n")
+        res.write("event: greet\ndata: world\n\n")
+        res.end()
+      },
+      basePort + 14,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.headers.get("Content-Type") shouldBe Some("text/event-stream")
+        resp.headers.get("Cache-Control") shouldBe Some("no-cache")
+        resp.headers.get("Transfer-Encoding") shouldBe Some("chunked")
+        resp.bodyString shouldBe
+          "event: greet\ndata: hello\n\nevent: greet\ndata: world\n\n"
+      }
+    }
+  }
+
+  "empty chunks are dropped (no premature termination)" in {
+    withServer(
+      { (_, res) =>
+        res.writeHead(200)
+        res.write("a")
+        res.write(Array.empty[Byte]) // must not emit a terminating zero-chunk
+        res.write("b")
+        res.end()
+      },
+      basePort + 15,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.bodyString shouldBe "ab"
+      }
+    }
+  }
+
+  "double end is ignored in streaming mode" in {
+    withServer(
+      { (_, res) =>
+        res.writeHead(200)
+        res.write("only")
+        res.end()
+        res.end()              // no-op
+        res.write("ignored")   // no-op
+      },
+      basePort + 16,
+    ) { port =>
+      HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+        resp.statusCode shouldBe 200
+        resp.bodyString shouldBe "only"
+      }
+    }
+  }
 end IntegrationTests

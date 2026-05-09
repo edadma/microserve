@@ -7,7 +7,7 @@ ThisBuild / scalaVersion           := "3.8.3"
 ThisBuild / organization           := "io.github.edadma"
 ThisBuild / organizationName       := "edadma"
 ThisBuild / organizationHomepage   := Some(url("https://github.com/edadma"))
-ThisBuild / version                := "0.3.0"
+ThisBuild / version                := "0.4.0"
 ThisBuild / description            := "A lightweight cross-platform HTTP server for Scala (JVM/JS/Native)"
 ThisBuild / sonatypeCredentialHost := sonatypeCentralHost
 
@@ -63,8 +63,8 @@ lazy val microserve = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   )
   .nativeSettings(
     libraryDependencies ++= Seq(
-      "io.github.edadma" %%% "libuv" % "0.0.31",
-      "io.github.edadma" %%% "async" % "0.0.17",
+      "io.github.edadma" %%% "libuv" % "0.0.32",
+      "io.github.edadma" %%% "async" % "0.0.18",
     ),
   )
 

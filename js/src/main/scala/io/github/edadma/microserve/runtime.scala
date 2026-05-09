@@ -27,6 +27,8 @@ private[microserve] class JsRuntime extends Runtime:
   def connect(host: String, port: Int): Future[ConnectionTransport] =
     new NetClientConnect().connect(host, port)
 
+  def newFsWatcher(): FsWatcher = new NodeFsWatcher(executionContext)
+
   /** No-op: Node owns its loop. The presence of any active handle (server or
     * pending timer) keeps the process alive automatically.
     */

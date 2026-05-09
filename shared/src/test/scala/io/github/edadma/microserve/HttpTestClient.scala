@@ -65,16 +65,20 @@ object HttpTestClient:
     responsePromise.future
   end request
 
-  /** Parse `<headers>\r\n\r\n<body>`. Body length is whatever bytes follow the
-    * blank line — works because we always send `Connection: close`, so the
-    * server emits its full body and shuts down. No support for chunked
-    * transfer-encoding (microserve never emits it).
+  /** Parse `<headers>\r\n\r\n<body>`. The body interpretation depends on the
+    * `Transfer-Encoding` header:
+    *
+    *   - `chunked`: decode RFC 7230 §4.1 chunks into a flat byte buffer, stop
+    *     at the zero-chunk terminator (`0\r\n\r\n`).
+    *   - anything else (including absent): treat the rest of the buffer as
+    *     the body. Works because the test client always sends
+    *     `Connection: close`, so the server emits everything and hangs up.
     */
   private def parse(bytes: Array[Byte]): TestResponse =
     val sep = indexOf(bytes, "\r\n\r\n".getBytes("ISO-8859-1"))
     require(sep >= 0, "incomplete response (no header/body separator)")
     val headerStr = new String(bytes, 0, sep, "ISO-8859-1")
-    val bodyBytes = java.util.Arrays.copyOfRange(bytes, sep + 4, bytes.length)
+    val rawBody = java.util.Arrays.copyOfRange(bytes, sep + 4, bytes.length)
     val lines = headerStr.split("\r\n").nn
 
     val statusLine = lines(0).nn
@@ -90,17 +94,56 @@ object HttpTestClient:
       else Some(l.substring(0, idx).nn -> l.substring(idx + 2).nn)
     }.toMap
 
+    val bodyBytes =
+      if headers.get("Transfer-Encoding").exists(_.equalsIgnoreCase("chunked"))
+      then decodeChunked(rawBody)
+      else rawBody
+
     TestResponse(statusCode, statusMessage, headers, bodyBytes)
 
-  /** Naive substring search over a byte array. We only need it to find
-    * `\r\n\r\n` once per response, so a Boyer–Moore is overkill.
+  /** Decode an RFC 7230 §4.1 chunked body. Each chunk is `<hex>\r\n<data>\r\n`
+    * and the body ends at a zero-length chunk (`0\r\n\r\n` — optional trailers
+    * not supported). Anything malformed throws.
     */
-  private def indexOf(haystack: Array[Byte], needle: Array[Byte]): Int =
+  private def decodeChunked(buf: Array[Byte]): Array[Byte] =
+    val out = scala.collection.mutable.ArrayBuffer.empty[Byte]
     var i = 0
+    while i < buf.length do
+      val crlf = indexOf(buf, "\r\n".getBytes("ISO-8859-1"), i)
+      require(crlf >= 0, "chunked: no CRLF after size")
+      val sizeStr = new String(buf, i, crlf - i, "ISO-8859-1").nn.trim.nn
+      // Size line may have chunk-extensions after `;` — strip them.
+      val sizeOnly = sizeStr.indexOf(';') match
+        case -1 => sizeStr
+        case k  => sizeStr.substring(0, k).nn.trim.nn
+      val size = Integer.parseInt(sizeOnly, 16)
+      i = crlf + 2
+      if size == 0 then
+        // Trailers (if any) until \r\n\r\n; we ignore them.
+        return out.toArray
+      val end = i + size
+      require(end <= buf.length, "chunked: data shorter than declared size")
+      var k = i
+      while k < end do
+        out += buf(k)
+        k += 1
+      i = end
+      // Skip CRLF that follows the data.
+      require(i + 1 < buf.length && buf(i) == '\r'.toByte && buf(i + 1) == '\n'.toByte, "chunked: missing CRLF after data")
+      i += 2
+    out.toArray
+
+  /** Indexed substring search starting at `from`. */
+  private def indexOf(haystack: Array[Byte], needle: Array[Byte], from: Int): Int =
+    var i = from
     while i <= haystack.length - needle.length do
       var j = 0
       while j < needle.length && haystack(i + j) == needle(j) do j += 1
       if j == needle.length then return i
       i += 1
     -1
+
+  /** Convenience: search from start. */
+  private def indexOf(haystack: Array[Byte], needle: Array[Byte]): Int =
+    indexOf(haystack, needle, 0)
 end HttpTestClient

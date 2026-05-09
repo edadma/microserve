@@ -26,6 +26,15 @@ trait Runtime:
     */
   def connect(host: String, port: Int): Future[ConnectionTransport]
 
+  /** Construct a fresh [[FsWatcher]]. Each watcher owns its own platform
+    * resources; call `close()` on it when finished.
+    *
+    * The watcher delivers events on this runtime's `executionContext`, so
+    * handlers run on the same thread as HTTP request handlers and Future
+    * continuations.
+    */
+  def newFsWatcher(): FsWatcher
+
   /** Drive the loop until all servers have closed and all connections drained.
     *
     *   - JVM: blocks on the internal `EventLoop.run()`.

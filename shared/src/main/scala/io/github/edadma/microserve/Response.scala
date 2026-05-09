@@ -3,26 +3,49 @@ package io.github.edadma.microserve
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
-/** The platform-neutral HTTP response. Composes the wire bytes (status line,
-  * headers, body) and delegates the actual write to a `ConnectionTransport`
-  * supplied at construction.
+/** The platform-neutral HTTP response.
   *
-  * Calling any terminal method (`send`, `sendJson`, `sendHtml`, `sendStatus`,
-  * `end`) more than once is a no-op — the second call returns
-  * `Future.successful(())` immediately, mirroring Node.js semantics.
+  * Two modes, picked implicitly:
+  *
+  *   - **One-shot.** `send` / `sendJson` / `sendHtml` / `sendStatus` / `end(body)`
+  *     compose status line + headers + body in one buffer with `Content-Length`,
+  *     write once, and call `onFinish`. Suitable for ordinary HTTP responses.
+  *
+  *   - **Streaming (chunked).** Calling `write(chunk)` before any one-shot
+  *     terminator switches the response to `Transfer-Encoding: chunked` —
+  *     headers are flushed on first `write`, each subsequent `write` emits a
+  *     proper chunk frame, and `end()` (or `end(body)` with optional final
+  *     bytes) emits the terminating `0\r\n\r\n`. Suitable for SSE, NDJSON,
+  *     long polling, large file streaming.
+  *
+  * Calling any terminator more than once is a no-op (mirrors Node.js).
+  *
+  * @param onStreamStart Fires the first time `write` flushes streaming
+  *                      headers. ConnectionState uses this to cancel its idle
+  *                      timeout for the duration of the stream — without it,
+  *                      a long-running SSE connection would be killed at the
+  *                      30s idle threshold despite being actively serving.
   */
 class Response private[microserve] (
     private val transport: ConnectionTransport,
     private val httpVersion: String = "1.1",
     private val requestConnectionHeader: Option[String] = None,
+    private val onStreamStart: () => Unit = () => (),
     private val onFinish: Boolean => Unit = _ => (),
 ):
   private var _statusCode: Int = 200
   private var _statusMessage: String = "OK"
   private val headers = mutable.LinkedHashMap[String, String]()
   private var headersSent = false
+  private var streaming = false
+  private var ended = false
 
-  def isSent: Boolean = headersSent
+  /** True iff a terminator has run and the response is closed to further
+    * writes. Equivalent to "headers AND body are fully on the wire (or being
+    * flushed)". Distinguished from `headersSent` because in streaming mode
+    * headers fly long before `end()` does.
+    */
+  def isSent: Boolean = ended
 
   def status(code: Int): Response =
     _statusCode = code
@@ -33,10 +56,17 @@ class Response private[microserve] (
     headers(key) = String.valueOf(value)
     this
 
+  /** Set status + initial headers in one call. Chainable. Does NOT flush; the
+    * actual header bytes go out on the first `write` (streaming) or terminator
+    * (one-shot). Mirrors Node's `res.writeHead` shape, except Node flushes
+    * immediately — we flush lazily so a chained `.set(...)` still works.
+    */
   def writeHead(code: Int, hdrs: Map[String, String] = Map.empty): Response =
     status(code)
     hdrs.foreach((k, v) => headers(k) = v)
     this
+
+  // -- one-shot terminators --------------------------------------------------
 
   def send(data: String): Future[Unit] =
     headers.getOrElseUpdate("Content-Type", "text/plain; charset=UTF-8")
@@ -54,6 +84,43 @@ class Response private[microserve] (
     status(code)
     send(s"${HTTP.statusMessageString(code)}")
 
+  // -- streaming primitives --------------------------------------------------
+
+  /** Emit a chunk. Triggers chunked-encoding mode the first time it's called
+    * (flushing headers with `Transfer-Encoding: chunked`). After `end()` it's
+    * a no-op. Empty chunks are dropped — they're a valid mid-stream wire
+    * value but RFC 7230 reserves zero-length for the terminator, and emitting
+    * one accidentally would prematurely close the response.
+    */
+  def write(chunk: Array[Byte]): Future[Unit] =
+    if ended then return Future.successful(())
+    if !headersSent then beginStream()
+    if chunk.isEmpty then return Future.successful(())
+    transport.write(chunkFrame(chunk))
+
+  def write(chunk: String): Future[Unit] = write(chunk.getBytes("UTF-8"))
+
+  // -- terminator ------------------------------------------------------------
+
+  /** Terminate the response.
+    *
+    *   - **One-shot mode** (no prior `write`): compose status + headers +
+    *     `Content-Length: <body.length>` + body in one buffer.
+    *   - **Streaming mode** (prior `write` happened): write `body` as a final
+    *     chunk frame (if non-empty), then the zero-chunk terminator.
+    *
+    * Either way, `onFinish` runs synchronously with the keep-alive decision
+    * after the last write is queued.
+    */
+  def end(body: Array[Byte] = Array.empty): Future[Unit] =
+    if ended then return Future.successful(())
+    ended = true
+
+    if streaming then endStreaming(body) else endOneShot(body)
+  end end
+
+  // -- internals -------------------------------------------------------------
+
   /** True if this is HTTP/1.1 without `Connection: close`, or HTTP/1.0 with an
     * explicit `Connection: keep-alive`. Matches RFC 7230 §6.3.
     */
@@ -62,18 +129,55 @@ class Response private[microserve] (
     if httpVersion == "1.1" then !connHeader.contains("close")
     else connHeader.contains("keep-alive")
 
-  /** Compose the HTTP response and hand the bytes to the transport.
-    *
-    * The returned `Future` completes when the transport has accepted the bytes
-    * for delivery. The connection-keep-alive decision is made here and reported
-    * to `onFinish` regardless of whether the write itself succeeds — that's
-    * deliberate: `onFinish(false)` triggers connection close on the next read,
-    * which is what we want even if the write failed.
+  /** Flush status line + headers in chunked mode. Called from the first
+    * `write`. Marks the response as streaming so subsequent writes emit
+    * chunk frames and `end()` emits the zero-chunk terminator.
     */
-  def end(body: Array[Byte] = Array.empty): Future[Unit] =
-    if headersSent then return Future.successful(())
+  private def beginStream(): Unit =
+    streaming = true
     headersSent = true
 
+    headers.getOrElseUpdate("Date", httpDateNow())
+    headers("Transfer-Encoding") = "chunked"
+    headers.remove("Content-Length") // mutually exclusive with chunked
+
+    val keepAlive = shouldKeepAlive
+    if keepAlive then headers.getOrElseUpdate("Connection", "keep-alive")
+    else headers("Connection") = "close"
+
+    val buf = new StringBuilder
+    buf ++= s"HTTP/$httpVersion ${_statusCode} ${_statusMessage}\r\n"
+    headers.foreach((k, v) => buf ++= s"$k: $v\r\n")
+    buf ++= "\r\n"
+
+    transport.write(buf.toString.getBytes("ISO-8859-1"))
+    onStreamStart()
+
+  /** RFC 7230 §4.1 chunk: `<hex-size>\r\n<data>\r\n`. The hex size is the
+    * data length, lowercase or uppercase — we use lowercase. No
+    * chunk-extensions emitted.
+    */
+  private def chunkFrame(bytes: Array[Byte]): Array[Byte] =
+    val hex = bytes.length.toHexString
+    val header = s"$hex\r\n".getBytes("ISO-8859-1")
+    val trailer = "\r\n".getBytes("ISO-8859-1")
+    val out = new Array[Byte](header.length + bytes.length + trailer.length)
+    System.arraycopy(header, 0, out, 0, header.length)
+    System.arraycopy(bytes, 0, out, header.length, bytes.length)
+    System.arraycopy(trailer, 0, out, header.length + bytes.length, trailer.length)
+    out
+
+  private def endStreaming(body: Array[Byte]): Future[Unit] =
+    // Optional final chunk (if `end(body)` was called streaming).
+    if body.nonEmpty then transport.write(chunkFrame(body))
+
+    // Zero-chunk terminator: "0\r\n\r\n".
+    val terminator = transport.write("0\r\n\r\n".getBytes("ISO-8859-1"))
+    onFinish(shouldKeepAlive)
+    terminator
+
+  private def endOneShot(body: Array[Byte]): Future[Unit] =
+    headersSent = true
     headers.getOrElseUpdate("Date", httpDateNow())
     headers("Content-Length") = body.length.toString
 
@@ -98,7 +202,6 @@ class Response private[microserve] (
     val writeFuture = transport.write(response)
     onFinish(keepAlive)
     writeFuture
-  end end
 end Response
 
 /** Cross-platform HTTP-date helper. Avoids `java.time` (Scala Native's coverage

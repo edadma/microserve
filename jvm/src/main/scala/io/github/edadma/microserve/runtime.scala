@@ -54,6 +54,8 @@ private[microserve] class JvmRuntime extends Runtime:
   def connect(host: String, port: Int): Future[ConnectionTransport] =
     new NioClientConnect(loop).connect(host, port)
 
+  def newFsWatcher(): FsWatcher = new NioFsWatcher(executionContext)
+
   /** Drop the phantom ref and wait for the daemon to finish. The loop exits
     * naturally once all `Server`s have closed and their connections drained.
     * Calling this multiple times is safe — second call returns immediately

@@ -76,6 +76,8 @@ private[microserve] class NativeRuntime extends Runtime:
   def connect(host: String, port: Int): Future[ConnectionTransport] =
     new LibuvClientConnect().connect(host, port)
 
+  def newFsWatcher(): FsWatcher = new LibuvFsWatcher(executionContext)
+
   /** Drop the phantom handle and wait for the driver to drain. Calling
     * multiple times is safe; the second call returns immediately because the
     * driver is already gone.

@@ -92,6 +92,11 @@ private[microserve] class ConnectionState(
       transport = transport,
       httpVersion = httpVer,
       requestConnectionHeader = connHeader,
+      onStreamStart = () =>
+        // SSE / chunked streaming responses can run for minutes or hours;
+        // the 30s idle timeout would close them despite the server actively
+        // serving. Re-armed by the keep-alive branch in onFinish.
+        cancelIdleTimeout(),
       onFinish = keepAlive =>
         idle = true
         if keepAlive && !isServerClosing() then resetIdleTimeout()
