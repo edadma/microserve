@@ -56,7 +56,19 @@ trait Timers:
 
 /** A bound TCP listener. */
 trait ServerTransport:
-  def listen(host: String, port: Int)(onListening: () => Unit): Unit
+  /** Bind and start accepting on `host:port`. `onListening` fires once the
+    * socket is bound and ready. `onError` fires (asynchronously, on the loop)
+    * if the bind itself fails — typically `BindException` / `EADDRINUSE` / a
+    * libuv error code translated to an exception. After `onError`, the
+    * transport is unusable and should be discarded.
+    *
+    * Implementations MUST guarantee at most one of `onListening` / `onError`
+    * fires per `listen` call.
+    */
+  def listen(host: String, port: Int)(
+      onListening: () => Unit,
+      onError:     Throwable => Unit = _ => (),
+  ): Unit
 
   /** Port we're listening on. Only meaningful after `listen` callback fires. */
   def actualPort: Int

@@ -305,4 +305,121 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
       }
     }
   }
+
+  // -- listen onError --------------------------------------------------------
+  // Verifies the new bind-error reporting: two servers contending for the
+  // same port — the second's `onError` must fire, and `onListening` must not.
+
+  "second listen on a busy port surfaces an error via onError" in {
+    val port = basePort + 17
+    val firstReady = Promise[Unit]()
+    val first = createServer { (_, res) => res.send("first") }
+    first.listen(port, "127.0.0.1") { () => firstReady.success(()) }
+
+    firstReady.future.flatMap { _ =>
+      val errPromise = Promise[Throwable]()
+      val unexpectedListening = Promise[Unit]()
+      val second = createServer { (_, res) => res.send("second") }
+      second.listen(port, "127.0.0.1")(
+        onListening = () => unexpectedListening.trySuccess(()),
+        onError     = e => errPromise.trySuccess(e),
+      )
+
+      // Whichever fires first wins. We expect onError. Cap the wait so a hung
+      // platform doesn't leave the test running forever.
+      val timers = summon[Runtime].timers
+      val timeout = Promise[Throwable]()
+      val _ = timers.setTimeout(3000)(() =>
+        timeout.trySuccess(new RuntimeException("onError did not fire within 3s")),
+      )
+
+      val race = Future.firstCompletedOf(Seq(
+        errPromise.future.map(Right(_)),
+        unexpectedListening.future.map(_ => Left("onListening fired despite busy port")),
+        timeout.future.map(t => Left(t.getMessage)),
+      ))
+
+      race.transformWith { result =>
+        val drained = Promise[Unit]()
+        first.close(() => drained.success(()))
+        second.close()
+        drained.future.transform { _ =>
+          result.map {
+            case Right(_) => succeed
+            case Left(msg) => fail(msg)
+          }
+        }
+      }
+    }
+  }
+
+  // -- Response.onClose ------------------------------------------------------
+  // Verifies the per-response close hook fires when the underlying TCP
+  // connection drops mid-stream. The client opens a raw connection, reads
+  // the first chunk to know the handler is live, then closes — the handler
+  // should observe the close via the registered callback within a few
+  // hundred ms.
+
+  "Response.onClose fires when the client disconnects mid-stream" in {
+    val port = basePort + 18
+    val closeObserved = Promise[Unit]()
+    val firstChunkSent = Promise[Unit]()
+
+    val server = createServer { (_, res) =>
+      res.onClose(() => closeObserved.trySuccess(()))
+      res.writeHead(200, Map("Content-Type" -> "text/event-stream"))
+      res.write("data: hello\n\n").map(_ => firstChunkSent.trySuccess(()))
+    }
+
+    val listening = Promise[Unit]()
+    server.listen(port, "127.0.0.1") { () => listening.success(()) }
+
+    listening.future.flatMap { _ =>
+      val runtime = summon[Runtime]
+      runtime.connect("127.0.0.1", port).flatMap { conn =>
+        // Accumulate response bytes; once we see the chunk's hex header we
+        // know the stream is live and it's safe to drop the connection to
+        // exercise onClose.
+        val received = scala.collection.mutable.ArrayBuffer.empty[Byte]
+        val gotBody = Promise[Unit]()
+        conn.onRead { chunk =>
+          received ++= chunk
+          // "data: " arrives once headers + first chunk frame have flushed.
+          if !gotBody.isCompleted &&
+             new String(received.toArray, "ISO-8859-1").contains("data: hello")
+          then gotBody.success(())
+        }
+        conn.onClose(() => ())
+
+        val req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".getBytes("ISO-8859-1")
+        val _ = conn.write(req)
+
+        gotBody.future.flatMap { _ =>
+          // Drop the client side of the TCP connection — the server should
+          // observe this via its transport's onClose, which in turn fires
+          // our Response.onClose.
+          conn.close()
+
+          val timers = runtime.timers
+          val timeout = Promise[Boolean]()
+          val _ = timers.setTimeout(3000)(() => timeout.trySuccess(false))
+          val raceResult = Future.firstCompletedOf(Seq(
+            closeObserved.future.map(_ => true),
+            timeout.future,
+          ))
+
+          raceResult.transformWith { res =>
+            val drained = Promise[Unit]()
+            server.close(() => drained.success(()))
+            drained.future.transform { _ =>
+              res.map {
+                case true  => succeed
+                case false => fail("Response.onClose did not fire within 3s")
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 end IntegrationTests

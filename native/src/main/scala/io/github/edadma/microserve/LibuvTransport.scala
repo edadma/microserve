@@ -28,22 +28,34 @@ private[microserve] class LibuvServerTransport extends ServerTransport:
 
   def onAccept(handler: ConnectionTransport => Unit): Unit = acceptHandler = handler
 
-  def listen(host: String, port: Int)(onListening: () => Unit): Unit =
+  def listen(host: String, port: Int)(
+      onListening: () => Unit,
+      onError:     Throwable => Unit = _ => (),
+  ): Unit =
     val s = defaultLoop.tcp
     server = Some(s)
-    s.bind(host, port, 0)
-    s.listen(
-      128,
-      { (handle: TCP, status: Int) =>
-        if status >= 0 && !closed then
-          val client = defaultLoop.tcp
-          handle.accept(client)
-          val transport = new LibuvConnectionTransport(client)
-          acceptHandler(transport)
-        else if status < 0 then
-          Console.err.println(s"libuv listen error: ${strError(status)}")
-      },
-    )
+    try
+      s.bind(host, port, 0)
+      s.listen(
+        128,
+        { (handle: TCP, status: Int) =>
+          if status >= 0 && !closed then
+            val client = defaultLoop.tcp
+            handle.accept(client)
+            val transport = new LibuvConnectionTransport(client)
+            acceptHandler(transport)
+          else if status < 0 then
+            Console.err.println(s"libuv listen error: ${strError(status)}")
+        },
+      )
+    catch
+      case e: Throwable =>
+        // bind/listen reported a synchronous error (most often EADDRINUSE).
+        // Release the half-initialised handle and surface the failure.
+        try if !s.isClosing then s.close() catch case _: Throwable => ()
+        server = None
+        onError(e)
+        return
 
     // libuv has no direct "what port did we bind to" call wired into the
     // spritzsn wrapper's TCP class. For "port 0 → ephemeral" we'd need

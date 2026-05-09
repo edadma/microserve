@@ -39,6 +39,8 @@ class Response private[microserve] (
   private var headersSent = false
   private var streaming = false
   private var ended = false
+  private var closeHandler: () => Unit = () => ()
+  private var closeFired = false
 
   /** True iff a terminator has run and the response is closed to further
     * writes. Equivalent to "headers AND body are fully on the wire (or being
@@ -65,6 +67,32 @@ class Response private[microserve] (
     status(code)
     hdrs.foreach((k, v) => headers(k) = v)
     this
+
+  /** Register a callback that fires exactly once when the underlying
+    * connection closes — peer disconnect, network error, or server shutdown.
+    *
+    * Useful for streaming responses (SSE, NDJSON, long-poll) where the
+    * server holds a long-lived `Response` reference: when the client tab
+    * closes, the channel can prune the dead subscriber immediately instead
+    * of discovering the disconnect on the next failed `write`.
+    *
+    * For one-shot responses this typically fires after `onFinish` (clean
+    * keep-alive close after the response went out), so it's harmless but
+    * usually uninteresting. The callback fires at most once per response;
+    * setting it multiple times keeps only the last handler.
+    */
+  def onClose(handler: () => Unit): Unit =
+    closeHandler = handler
+
+  /** Internal — invoked by [[ConnectionState]] when the underlying transport
+    * closes. Fires the user's `onClose` handler exactly once and marks the
+    * response as terminated so any subsequent `write`/`end` is a no-op.
+    */
+  private[microserve] def fireClose(): Unit =
+    if closeFired then return
+    closeFired = true
+    ended = true
+    try closeHandler() catch case _: Throwable => ()
 
   // -- one-shot terminators --------------------------------------------------
 

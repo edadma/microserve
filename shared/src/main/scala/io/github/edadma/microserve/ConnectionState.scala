@@ -22,6 +22,13 @@ private[microserve] class ConnectionState(
   private var idle = true
   private var idleTimeoutCancel: () => Unit = null
 
+  // The Response currently being built/streamed by a handler, if any. Tracked
+  // so that a transport close (peer disconnect mid-stream, network error,
+  // server shutdown) can fire the response's `onClose` callback — the only
+  // way a long-lived SSE handler learns its subscriber went away in real
+  // time, instead of discovering it on the next failed `write`.
+  private var currentResponse: Response = null
+
   // Wire transport callbacks before any I/O can happen.
   transport.onClose(() => onTransportClose())
   transport.onRead(bytes => onBytes(bytes))
@@ -98,10 +105,15 @@ private[microserve] class ConnectionState(
         // serving. Re-armed by the keep-alive branch in onFinish.
         cancelIdleTimeout(),
       onFinish = keepAlive =>
+        // Clean termination — clear the "in-flight" pointer so a later
+        // transport close doesn't fire onClose against an already-finished
+        // response.
+        currentResponse = null
         idle = true
         if keepAlive && !isServerClosing() then resetIdleTimeout()
         else closeConnection(),
     )
+    currentResponse = res
 
     val fut =
       try handler(req, res)
@@ -121,6 +133,13 @@ private[microserve] class ConnectionState(
     if closed then return
     closed = true
     cancelIdleTimeout()
+    // If a handler is still mid-flight (typical for SSE / streaming), wake
+    // it up so it can release its subscriber state. Cleared either way to
+    // break the reference and let the Response GC.
+    if currentResponse != null then
+      val r = currentResponse
+      currentResponse = null
+      r.fireClose()
     onConnectionClosed(this)
 
   /** Close request originating from us (timeout / drain / handler error).

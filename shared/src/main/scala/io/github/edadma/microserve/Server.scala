@@ -37,14 +37,24 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
 
   def actualPort: Int = transport.actualPort
 
-  /** Bind and start accepting. `onListening` fires once the socket is bound.
+  /** Bind and start accepting. `onListening` fires once the socket is bound;
+    * `onError` fires (asynchronously, on the loop) if the bind fails — most
+    * commonly because the port is already in use. After `onError`, this
+    * server is unusable; construct a fresh one if you want to retry on a
+    * different port.
+    *
     * Calling more than once is undefined behaviour (matches Node.js).
     */
-  def listen(port: Int, host: String = "0.0.0.0")(onListening: () => Unit = () => ()): Unit =
-    transport.listen(host, port) { () =>
-      _listening = true
-      onListening()
-    }
+  def listen(port: Int, host: String = "0.0.0.0")(
+      onListening: () => Unit          = () => (),
+      onError:     Throwable => Unit   = _ => (),
+  ): Unit =
+    transport.listen(host, port)(
+      () =>
+        _listening = true
+        onListening(),
+      e => onError(e),
+    )
 
   private def onConnectionClosed(state: ConnectionState): Unit =
     connections -= state

@@ -20,12 +20,23 @@ private[microserve] class NioServerTransport(loop: EventLoop) extends ServerTran
   def onAccept(handler: ConnectionTransport => Unit): Unit =
     acceptHandler = handler
 
-  def listen(host: String, port: Int)(onListening: () => Unit): Unit =
-    channel.configureBlocking(false)
-    channel.bind(new InetSocketAddress(host, port))
-    key = loop.register(channel, SelectionKey.OP_ACCEPT, new AcceptHandler)
-    loop.ref()
-    loop.nextTick(onListening)
+  def listen(host: String, port: Int)(
+      onListening: () => Unit,
+      onError:     Throwable => Unit = _ => (),
+  ): Unit =
+    try
+      channel.configureBlocking(false)
+      channel.bind(new InetSocketAddress(host, port))
+      key = loop.register(channel, SelectionKey.OP_ACCEPT, new AcceptHandler)
+      loop.ref()
+      loop.nextTick(onListening)
+    catch
+      case e: Exception =>
+        // Bind/configure failed — clean up the unused channel and surface the
+        // error on the loop so the user sees it from the same thread that
+        // would have called `onListening`.
+        try channel.close() catch case _: Exception => ()
+        loop.nextTick(() => onError(e))
 
   def close(): Unit =
     if key != null then

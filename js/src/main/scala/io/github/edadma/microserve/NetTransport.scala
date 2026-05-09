@@ -21,6 +21,11 @@ private[microserve] object NodeNet:
     def listen(port: Int, hostname: String, callback: js.Function0[Unit]): NetServer = js.native
     def close(callback: js.Function0[Unit]): NetServer = js.native
     def address(): js.Dynamic = js.native
+    /** Subscribe to a server-level event (`'error'`, `'close'`, …). Required
+      * for surfacing bind failures (`EADDRINUSE` etc.) which Node delivers
+      * asynchronously *after* `listen` returns.
+      */
+    def on(event: String, listener: js.Function1[js.Any, Unit]): NetServer = js.native
 
   @js.native
   trait Socket extends js.Object:
@@ -43,10 +48,20 @@ private[microserve] class NetServerTransport extends ServerTransport:
 
   def onAccept(handler: ConnectionTransport => Unit): Unit = acceptHandler = handler
 
-  def listen(host: String, port: Int)(onListening: () => Unit): Unit =
+  def listen(host: String, port: Int)(
+      onListening: () => Unit,
+      onError:     Throwable => Unit = _ => (),
+  ): Unit =
     server = net.createServer { (socket: Socket) =>
       acceptHandler(new NetConnectionTransport(socket))
     }
+    // Register the error handler BEFORE `listen` — Node emits `'error'`
+    // asynchronously after `listen` returns when the bind itself fails
+    // (e.g. EADDRINUSE), so the listener must already be attached when the
+    // event fires on the next tick.
+    server.on("error", { (err: js.Any) =>
+      onError(new RuntimeException(s"listen failed: $err"))
+    })
     server.listen(
       port,
       host,
