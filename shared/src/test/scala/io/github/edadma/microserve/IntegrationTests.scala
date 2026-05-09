@@ -422,4 +422,195 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
       }
     }
   }
+  // -- streaming + concurrent request interaction ----------------------------
+  // Reproduces the wedge that surfaced from juicer's `serve --live-reload`
+  // experience: with a long-lived SSE connection open, the next plain
+  // request to the SAME server should still respond promptly. A real bug
+  // here makes the second request wait ~30 seconds (the idle-timeout
+  // length) before the server picks it up. We give it a generous 2s
+  // budget so the assertion failure blames the bug, not test slowness.
+
+  "plain request stays fast while a long-lived SSE stream is open" in {
+    val port = basePort + 19
+    val sseChunkSent = Promise[Unit]()
+
+    val server = createServer { (req, res) =>
+      if req.path == "/sse" then
+        res.writeHead(200, Map(
+          "Content-Type"  -> "text/event-stream",
+          "Cache-Control" -> "no-cache",
+        ))
+        // Flush once so the client knows the stream is live; then leave
+        // the response open. No `end()` — this is a deliberate forever-open.
+        res.write("retry: 1000\n\n").map(_ => sseChunkSent.trySuccess(()))
+      else
+        res.send("hello")
+    }
+
+    val listening = Promise[Unit]()
+    server.listen(port, "127.0.0.1") { () => listening.success(()) }
+
+    listening.future.flatMap { _ =>
+      val runtime = summon[Runtime]
+      val timers  = runtime.timers
+
+      // Open the SSE connection on connection A. We hold the conn open
+      // (no close()) so the server keeps streaming until test cleanup.
+      runtime.connect("127.0.0.1", port).flatMap { sseConn =>
+        sseConn.onRead(_ => ())
+        sseConn.onClose(() => ())
+        val sseReq = "GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".getBytes("ISO-8859-1")
+        val _ = sseConn.write(sseReq)
+
+        sseChunkSent.future.flatMap { _ =>
+          // SSE is live — now fire a plain GET on a separate connection
+          // and time it. The standard HttpTestClient uses Connection:
+          // close, so the server should respond once and hang up.
+          val started = System.currentTimeMillis()
+          val plainResult =
+            HttpTestClient.request("127.0.0.1", port, "GET", "/").map { resp =>
+              val elapsed = System.currentTimeMillis() - started
+              (resp, elapsed)
+            }
+
+          // Cap with a 5s timeout so a true wedge fails the test instead
+          // of hanging the whole suite.
+          val timeout = Promise[(TestResponse, Long)]()
+          val _ = timers.setTimeout(5000)(() =>
+            timeout.tryFailure(new RuntimeException("plain GET did not return within 5s — bug reproduced")),
+          )
+
+          val raceResult = Future.firstCompletedOf(Seq(plainResult, timeout.future))
+
+          raceResult.transformWith { res =>
+            sseConn.close()
+            val drained = Promise[Unit]()
+            server.close(() => drained.success(()))
+            drained.future.transform { _ =>
+              res.map { case (resp, elapsed) =>
+                resp.statusCode shouldBe 200
+                resp.bodyString shouldBe "hello"
+                // The actual wire-level work for /hello is sub-millisecond;
+                // anything beyond ~1s indicates the wedge.
+                withClue(s"plain GET took ${elapsed}ms while SSE was open: ") {
+                  elapsed should be < 1000L
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Tighter reproduction: simulates a user clicking through ~6 pages in
+  // rapid succession with juicer's serve --live-reload running. Each
+  // "navigation" overlaps an old SSE close with a new SSE open and a plain
+  // HTML fetch — the same pattern the browser produces. Reported symptom:
+  // one of the plain HTML fetches takes ~30s before responding.
+
+  "plain requests stay fast through six rapid SSE close/open cycles" in {
+    val port = basePort + 20
+
+    val server = createServer { (req, res) =>
+      if req.path == "/sse" then
+        res.writeHead(200, Map(
+          "Content-Type"  -> "text/event-stream",
+          "Cache-Control" -> "no-cache",
+        ))
+        // Forever-open: write once and return; never call end().
+        res.write("retry: 1000\n\n")
+      else
+        res.send("hello")
+    }
+
+    val listening = Promise[Unit]()
+    server.listen(port, "127.0.0.1") { () => listening.success(()) }
+
+    listening.future.flatMap { _ =>
+      val runtime = summon[Runtime]
+      val timers  = runtime.timers
+
+      // Open an SSE connection and wait until the first chunk arrives so
+      // we KNOW the stream is live. Returns the open ConnectionTransport
+      // for the caller to close when ready.
+      def openSse(): Future[ConnectionTransport] = {
+        val ready = Promise[Unit]()
+        runtime.connect("127.0.0.1", port).flatMap { conn =>
+          val received = scala.collection.mutable.ArrayBuffer.empty[Byte]
+          conn.onRead { chunk =>
+            received ++= chunk
+            if !ready.isCompleted &&
+               new String(received.toArray, "ISO-8859-1").contains("retry: 1000")
+            then ready.success(())
+          }
+          conn.onClose(() => ())
+          val _ = conn.write("GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".getBytes("ISO-8859-1"))
+          ready.future.map(_ => conn)
+        }
+      }
+
+      // Loop body: simulate one "navigation" — fetch a plain HTML page,
+      // open the new page's SSE, close the previous page's SSE. Returns
+      // the new SSE connection plus the elapsed time of the plain fetch.
+      def navigateOnce(prevSse: ConnectionTransport): Future[(ConnectionTransport, Long)] = {
+        val started = System.currentTimeMillis()
+        HttpTestClient.request("127.0.0.1", port, "GET", "/").flatMap { resp =>
+          val elapsed = System.currentTimeMillis() - started
+          if resp.statusCode != 200 then
+            Future.failed(new RuntimeException(s"plain GET returned ${resp.statusCode}"))
+          else
+            openSse().map { newSse =>
+              prevSse.close()
+              (newSse, elapsed)
+            }
+        }
+      }
+
+      // Initial SSE (the "first page" is loaded). Then 6 navigations
+      // in sequence. Track every plain-GET timing so a regression
+      // points to the slow one.
+      val results = scala.collection.mutable.ArrayBuffer.empty[Long]
+      val start = openSse().flatMap { initialSse =>
+        // Sequential fold: each navigation waits for the previous to
+        // finish. This mirrors how the browser issues clicks one at a
+        // time but with overlapping connection lifecycles.
+        (1 to 6).foldLeft(Future.successful(initialSse)) { (acc, _) =>
+          acc.flatMap { sse =>
+            navigateOnce(sse).map { case (newSse, elapsed) =>
+              results += elapsed
+              newSse
+            }
+          }
+        }
+      }
+
+      // Cap with a 15s timeout so a wedge fails the test instead of
+      // hanging — 6 navigations × 30s wedge = ~180s without the cap.
+      val timeout = Promise[ConnectionTransport]()
+      val _ = timers.setTimeout(15000)(() =>
+        timeout.tryFailure(new RuntimeException(
+          s"navigation sequence did not complete within 15s — wedge reproduced. Timings so far: ${results.mkString(", ")}ms"
+        )),
+      )
+
+      val raceResult = Future.firstCompletedOf(Seq(start, timeout.future))
+
+      raceResult.transformWith { res =>
+        // Best-effort cleanup of whatever SSE connection is still open.
+        res.foreach(_.close())
+        val drained = Promise[Unit]()
+        server.close(() => drained.success(()))
+        drained.future.transform { _ =>
+          res.map { _ =>
+            withClue(s"per-navigation timings: ${results.mkString(", ")}ms — ") {
+              results.length shouldBe 6
+              all(results) should be < 1000L
+            }
+          }
+        }
+      }
+    }
+  }
+
 end IntegrationTests
