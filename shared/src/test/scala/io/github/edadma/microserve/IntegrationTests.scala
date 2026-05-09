@@ -306,6 +306,42 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
     }
   }
 
+  // -- hostname resolution ---------------------------------------------------
+  // libuv's `uv_ip4_addr` is a strict numeric-IPv4 parser; "localhost" and
+  // "" must be translated by the Native transport before the bind call,
+  // because JVM NIO and Node both accept them via DNS resolution and the
+  // cross-platform abstraction should match.
+
+  "listen accepts \"localhost\" as a synonym for 127.0.0.1" in {
+    val port = basePort + 22
+    val ready = Promise[Unit]()
+    val errored = Promise[Throwable]()
+    val server = createServer { (_, res) => res.send("ok") }
+    server.listen(port, "localhost")(
+      onListening = () => ready.success(()),
+      onError     = e => errored.trySuccess(e),
+    )
+    val raceResult = Future.firstCompletedOf(Seq(
+      ready.future.map(_ => Right(())),
+      errored.future.map(e => Left(e.getMessage)),
+    ))
+    raceResult.flatMap {
+      case Right(_) =>
+        HttpTestClient.request("127.0.0.1", port, "GET", "/").transformWith { res =>
+          val drained = Promise[Unit]()
+          server.close(() => drained.success(()))
+          drained.future.transform(_ => res.map { resp =>
+            resp.statusCode shouldBe 200
+            resp.bodyString shouldBe "ok"
+          })
+        }
+      case Left(msg) =>
+        val drained = Promise[Unit]()
+        server.close(() => drained.success(()))
+        drained.future.transform { _ => scala.util.Success(fail(s"binding to localhost failed: $msg")) }
+    }
+  }
+
   // -- listen onError --------------------------------------------------------
   // Verifies the new bind-error reporting: two servers contending for the
   // same port — the second's `onError` must fire, and `onListening` must not.

@@ -49,7 +49,24 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
       onListening: () => Unit          = () => (),
       onError:     Throwable => Unit   = _ => (),
   ): Unit =
-    transport.listen(host, port)(
+    // Normalise the host string before handing it to a transport. Without
+    // this, the three platforms behave inconsistently on the same input:
+    //   - JVM NIO does DNS, picks an interface based on the socket family
+    //   - Node also does DNS, but on macOS may pick ::1 (IPv6) for
+    //     "localhost" — clients connecting to 127.0.0.1 then get
+    //     ECONNREFUSED
+    //   - libuv's `uv_ip4_addr` is a strict numeric-IPv4 parser and rejects
+    //     "localhost" with EINVAL outright
+    // Map the two common dev-server defaults to canonical IPv4 strings so
+    // every transport sees the same numeric address. Anything else passes
+    // through unchanged — for arbitrary hostnames, callers should resolve
+    // via the OS first or pass an IP literal. (A future enhancement could
+    // route through `uv_getaddrinfo` / `dns.lookup` for full resolution.)
+    val resolvedHost = host.toLowerCase match
+      case "localhost" => "127.0.0.1"
+      case ""          => "0.0.0.0"
+      case h           => h
+    transport.listen(resolvedHost, port)(
       () =>
         _listening = true
         onListening(),
