@@ -107,21 +107,30 @@ private[microserve] class NodeFsWatcher(ec: ExecutionContext) extends FsWatcher:
           if rel.isEmpty then dirOrFile
           else if NodeFs.path.isAbsolute(rel) then rel
           else NodeFs.path.join(dirOrFile, rel)
-        val event = eventType match
+        // Translate Node's eventType to one of our FsEvent.Kind, or None for
+        // anything we don't care about. Using Option here instead of an
+        // early `return` keeps Scala 3 happy — non-local returns from inside
+        // a lambda are no longer supported.
+        val maybeEvent: Option[FsEvent] = eventType match
           case "rename" =>
-            // Existing → deleted; non-existing → created.
-            if fs.existsSync(full) then FsEvent(FsEvent.Kind.Created, full)
-            else FsEvent(FsEvent.Kind.Deleted, full)
+            // Existing → created; non-existing → deleted.
+            Some(
+              if fs.existsSync(full) then FsEvent(FsEvent.Kind.Created, full)
+              else FsEvent(FsEvent.Kind.Deleted, full),
+            )
           case "change" =>
-            FsEvent(FsEvent.Kind.Modified, full)
-          case _ => return
-        ec.execute(() => sub.onChange(event))
+            Some(FsEvent(FsEvent.Kind.Modified, full))
+          case _ => None
 
-        // On Linux, if a new directory appeared inside a recursive root, watch
-        // it too.
-        if isLinux && sub.recursive && event.kind == FsEvent.Kind.Created &&
-          fs.existsSync(full) && fs.statSync(full).isDirectory()
-        then registerLinuxRecursive(sub, full)
+        maybeEvent.foreach { event =>
+          ec.execute(() => sub.onChange(event))
+
+          // On Linux, if a new directory appeared inside a recursive root,
+          // watch it too.
+          if isLinux && sub.recursive && event.kind == FsEvent.Kind.Created &&
+            fs.existsSync(full) && fs.statSync(full).isDirectory()
+          then registerLinuxRecursive(sub, full)
+        }
       },
     )
     watchersBySub.get(sub).foreach(_ += w)
