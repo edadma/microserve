@@ -34,12 +34,23 @@ private[microserve] class LibuvFsWatcher(ec: ExecutionContext) extends FsWatcher
 
   def watch(path: String, recursive: Boolean = true)(onChange: FsEvent => Unit): () => Unit =
     if closed then return () => ()
+    // Resolve `path` to an absolute path BEFORE handing it to libuv, so the
+    // FsEvent paths we emit are uniformly absolute across all three
+    // platforms. JVM (`Paths.get(p).toAbsolutePath`) and Node
+    // (`path.resolve(p)`) both do this; libuv passes the input through
+    // unchanged. Without normalisation, callers that compare event paths
+    // against absolute reference paths (e.g. juicer's
+    // build-output-exclude filter) silently miss every event when the
+    // user runs the program with a relative `-s` argument — the symptom
+    // is a runaway rebuild loop where the build's own writes re-trigger
+    // the watcher.
+    val absPath = new java.io.File(path).getAbsolutePath
     val handle = defaultLoop.fsEvent
     val flags = if recursive then UV_FS_EVENT_RECURSIVE else 0
-    val sub = Subscription(path, handle, onChange)
+    val sub = Subscription(absPath, handle, onChange)
     subs += sub
 
-    handle.start(path, flags) { (h, filename, events, status) =>
+    handle.start(absPath, flags) { (h, filename, events, status) =>
       if status >= 0 then
         // libuv events can be UV_RENAME (creation/deletion) or UV_CHANGE
         // (modification). We can't tell create from delete from the flag
@@ -47,9 +58,9 @@ private[microserve] class LibuvFsWatcher(ec: ExecutionContext) extends FsWatcher
         // Created for rename (consistent with most rename semantics:
         // "something appeared") and Modified for change.
         val full =
-          if filename.isEmpty then path
+          if filename.isEmpty then absPath
           else if filename.startsWith("/") then filename
-          else s"$path/$filename"
+          else s"$absPath/$filename"
         val kind =
           if (events & UV_CHANGE) != 0 then FsEvent.Kind.Modified
           else FsEvent.Kind.Created // UV_RENAME — best effort
