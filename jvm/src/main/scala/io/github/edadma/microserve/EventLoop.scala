@@ -52,15 +52,22 @@ private[microserve] class EventLoop:
 
   def setTimeout(delayMs: Long)(callback: () => Unit): () => Unit =
     var cancelled = false
-    val id = { nextTimerId += 1; nextTimerId }
+    // `nextTimerId` and `timers` (a PriorityQueue) aren't thread-safe; ref()
+    // and unref() are. Stamp the deadline now so the wait is measured from
+    // the call site, then defer the ID + heap-enqueue to the loop thread by
+    // riding on the (thread-safe) microtask queue.
+    val deadline = System.currentTimeMillis() + delayMs
     ref()
-    val entry = TimerEntry(id, System.currentTimeMillis() + delayMs, () => {
-      if !cancelled then
-        cancelled = true
-        unref()
-        callback()
-    })
-    timers.enqueue(entry)
+    microtasks.add { () =>
+      nextTimerId += 1
+      val entry = TimerEntry(nextTimerId, deadline, () => {
+        if !cancelled then
+          cancelled = true
+          unref()
+          callback()
+      })
+      timers.enqueue(entry)
+    }
     selector.wakeup()
     () =>
       if !cancelled then
@@ -71,6 +78,9 @@ private[microserve] class EventLoop:
     var cancelled = false
     ref()
 
+    // Re-arm runs from inside a fired timer (loop thread), but the *first*
+    // arm may come from any caller thread — defer the initial enqueue via
+    // the microtask queue for the same reason as setTimeout.
     def schedule(): Unit =
       if !cancelled then
         timers.enqueue(TimerEntry(0, System.currentTimeMillis() + intervalMs, () => {
@@ -79,7 +89,8 @@ private[microserve] class EventLoop:
             schedule()
         }))
 
-    schedule()
+    microtasks.add(() => schedule())
+    selector.wakeup()
     () =>
       if !cancelled then
         cancelled = true
@@ -94,55 +105,78 @@ private[microserve] class EventLoop:
     selector.wakeup()
     key
 
+  /** Run a callback inside the loop, swallowing any non-fatal throwable so a
+    * single bad handler doesn't kill the loop daemon. Without this, an
+    * uncaught exception in a Future continuation, a timer fire, or an I/O
+    * handler tears the daemon down silently — every subsequent test then
+    * hangs because nothing pumps microtasks anymore. We log to stderr so
+    * the failure is at least visible.
+    */
+  private def safeRun(callback: () => Unit): Unit =
+    try callback()
+    catch
+      case fatal if !scala.util.control.NonFatal(fatal) => throw fatal
+      case e: Throwable => e.printStackTrace()
+
   private def drainMicrotasks(): Unit =
     var task = microtasks.poll()
     while task != null do
-      task()
+      safeRun(task)
       task = microtasks.poll()
 
   def run(): Unit =
     running = true
 
-    while running do
-      drainMicrotasks()
+    try
+      while running do
+        drainMicrotasks()
 
-      if _refCount.get() <= 0 && microtasks.isEmpty && immediates.isEmpty then
-        running = false
-      else
-        val timeout =
-          if microtasks.peek() != null || immediates.peek() != null then 0L
-          else if timers.isEmpty then 3000L
-          else
-            val nearest = timers.head.deadline
-            val now = System.currentTimeMillis()
-            math.max(0L, nearest - now)
+        if _refCount.get() <= 0 && microtasks.isEmpty && immediates.isEmpty then
+          running = false
+        else
+          val timeout =
+            if microtasks.peek() != null || immediates.peek() != null then 0L
+            else if timers.isEmpty then 3000L
+            else
+              val nearest = timers.head.deadline
+              val now = System.currentTimeMillis()
+              math.max(0L, nearest - now)
 
-        if timeout == 0L then selector.selectNow()
-        else selector.select(timeout)
+          if timeout == 0L then selector.selectNow()
+          else selector.select(timeout)
 
-        val now = System.currentTimeMillis()
-        while timers.nonEmpty && timers.head.deadline <= now do
-          val entry = timers.dequeue()
-          entry.callback()
-          drainMicrotasks()
+          val now = System.currentTimeMillis()
+          while timers.nonEmpty && timers.head.deadline <= now do
+            val entry = timers.dequeue()
+            safeRun(entry.callback)
+            drainMicrotasks()
 
-        val keys = selector.selectedKeys().iterator()
-        while keys.hasNext do
-          val key = keys.next()
-          keys.remove()
+          val keys = selector.selectedKeys().iterator()
+          while keys.hasNext do
+            val key = keys.next()
+            keys.remove()
 
-          if key.isValid then
-            val handler = key.attachment().asInstanceOf[SelectionKeyHandler]
-            if handler != null then
-              handler.handle(key)
-              drainMicrotasks()
+            if key.isValid then
+              val handler = key.attachment().asInstanceOf[SelectionKeyHandler]
+              if handler != null then
+                safeRun(() => handler.handle(key))
+                drainMicrotasks()
 
-        var imm = immediates.poll()
-        while imm != null do
-          imm()
-          drainMicrotasks()
-          imm = immediates.poll()
-    end while
+          var imm = immediates.poll()
+          while imm != null do
+            safeRun(imm)
+            drainMicrotasks()
+            imm = immediates.poll()
+      end while
+    catch
+      case t: Throwable =>
+        // Defensive: if anything inside the loop throws (unwrapped) it would
+        // silently kill the daemon — every microserve op then hangs because
+        // nothing pumps microtasks. safeRun above wraps every callback; this
+        // outer net catches anything missed (e.g. a bug in the loop itself).
+        Console.err.println(s"[microserve] event loop crashed: ${t.getMessage}")
+        t.printStackTrace()
+        throw t
 
   def stop(): Unit =
     running = false

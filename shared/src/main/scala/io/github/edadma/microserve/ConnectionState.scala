@@ -15,6 +15,7 @@ private[microserve] class ConnectionState(
     timers: Timers,
     onConnectionClosed: ConnectionState => Unit,
     isServerClosing: () => Boolean,
+    idleTimeoutMs: Long = 30000L,
 )(using ExecutionContext):
 
   private val parser = new HTTPRequestParser
@@ -44,7 +45,7 @@ private[microserve] class ConnectionState(
 
   private def resetIdleTimeout(): Unit =
     if idleTimeoutCancel != null then idleTimeoutCancel()
-    idleTimeoutCancel = timers.setTimeout(30000) { () =>
+    idleTimeoutCancel = timers.setTimeout(idleTimeoutMs) { () =>
       closeConnection()
     }
 

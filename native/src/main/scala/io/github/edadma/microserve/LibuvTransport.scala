@@ -4,6 +4,7 @@ import scala.collection.immutable.ArraySeq
 import scala.concurrent.{Future, Promise}
 import io.github.spritzsn.libuv as uv
 import io.github.spritzsn.libuv.{TCP, Buffer, defaultLoop, eof, errName, strError}
+import scala.scalanative.posix.sys.socket.AF_INET
 
 /** Native transport built on `spritzsn/libuv`. The libuv loop is the same one
   * that `spritzsn/async`'s ExecutionContext drives, so `Future` continuations
@@ -32,10 +33,38 @@ private[microserve] class LibuvServerTransport extends ServerTransport:
       onListening: () => Unit,
       onError:     Throwable => Unit = _ => (),
   ): Unit =
+    // libuv's `uv_ip4_addr` is a strict numeric-IPv4 parser; pass it a
+    // hostname and it returns EINVAL outright. JVM/Node both do DNS
+    // implicitly, so to keep parity we resolve any non-numeric host through
+    // libuv's async `uv_getaddrinfo` and bind on the first IPv4 result.
+    if isNumericIPv4(host) then bindNumeric(host, port, onListening, onError)
+    else
+      defaultLoop.getAddrInfo(
+        (status, addrs) =>
+          if status != 0 then
+            onError(BindError.InvalidHost(new RuntimeException(s"getaddrinfo($host): ${strError(status)}")))
+          else
+            addrs.find(_.family == AF_INET) match
+              case Some(a) => bindNumeric(a.ip, port, onListening, onError)
+              case None    =>
+                onError(BindError.InvalidHost(new RuntimeException(s"no IPv4 address for $host")))
+        ,
+        host,
+        null,
+        AF_INET,
+      )
+  end listen
+
+  private def bindNumeric(
+      ip:          String,
+      port:        Int,
+      onListening: () => Unit,
+      onError:     Throwable => Unit,
+  ): Unit =
     val s = defaultLoop.tcp
     server = Some(s)
     try
-      s.bind(host, port, 0)
+      s.bind(ip, port, 0)
       s.listen(
         128,
         { (handle: TCP, status: Int) =>
@@ -54,21 +83,50 @@ private[microserve] class LibuvServerTransport extends ServerTransport:
         // Release the half-initialised handle and surface the failure.
         try if !s.isClosing then s.close() catch case _: Throwable => ()
         server = None
-        onError(e)
+        onError(translateBindError(e))
         return
 
-    // libuv has no direct "what port did we bind to" call wired into the
-    // spritzsn wrapper's TCP class. For "port 0 → ephemeral" we'd need
-    // `uv_tcp_getsockname` exposed; until then we just report the requested
-    // port. Tests bind to fixed ports for that reason.
-    _actualPort = port
+    // Read the bound port back from the kernel. When the caller passed a
+    // fixed port we'd report the same value either way; when they passed 0
+    // (ephemeral), this is the only way to find out what they actually got.
+    // spritzsn/libuv 0.0.33+ exposes `getSockNameWithPort` for exactly this.
+    _actualPort =
+      try s.getSockNameWithPort._2
+      catch case _: Throwable => port
     onListening()
-  end listen
+  end bindNumeric
+
+  /** "Looks like a dotted-quad IPv4 literal" — 4 numeric components, each
+    * 0-255. Anything else (hostname, IPv6) routes through getaddrinfo.
+    */
+  private def isNumericIPv4(s: String): Boolean =
+    val parts = s.split('.')
+    parts.length == 4 && parts.forall { p =>
+      p.nonEmpty && p.length <= 3 && p.forall(_.isDigit) && {
+        val n = p.toInt
+        n >= 0 && n <= 255
+      }
+    }
 
   def close(): Unit =
     if closed then return
     closed = true
     server.foreach { s => if !s.isClosing then s.close() }
+
+  /** Map libuv's `errorMessage`-style RuntimeException strings to the
+    * cross-platform [[BindError]] taxonomy. spritzsn's `checkError` formats
+    * messages like `"uv_tcp_bind error: EADDRINUSE: address already in use"`,
+    * so we look for the libuv error name token (`EADDRINUSE` etc.) — far
+    * more stable than the human-readable suffix.
+    */
+  private def translateBindError(e: Throwable): BindError =
+    val msg = if e.getMessage != null then e.getMessage else ""
+    if msg.contains("EADDRINUSE")        then BindError.AddressInUse(e)
+    else if msg.contains("EACCES")       then BindError.PermissionDenied(e)
+    else if msg.contains("EINVAL")       then BindError.InvalidHost(e)
+    else if msg.contains("EADDRNOTAVAIL") then BindError.InvalidHost(e)
+    else if msg.contains("ENOTFOUND")     then BindError.InvalidHost(e)
+    else BindError.Other(e)
 end LibuvServerTransport
 
 /** Wraps a single accepted (or dialed) TCP handle. */

@@ -25,10 +25,11 @@ import scala.concurrent.{ExecutionContext, Future}
   * Thread safety: the [[EventLoop]] uses a `ConcurrentLinkedQueue` for the
   * microtask/immediate queues and an `AtomicInteger` for the ref-count, so
   * cross-thread `nextTick`, `unref`, and `executionContext.execute` are all
-  * safe. `setTimeout`'s priority queue is NOT thread-safe — callers must only
-  * invoke it from the loop thread. In practice every `setTimeout` site
-  * (idle-timeout in `ConnectionState`) runs from a callback already on the
-  * loop, so this constraint holds.
+  * safe. `setTimeout`/`setInterval` defer the actual `PriorityQueue` mutation
+  * onto the loop thread via the microtask queue, so they are also safe to
+  * call from any thread (test code, user-thread setup) without corrupting
+  * the heap. The deadline is stamped at the call site so the wait is measured
+  * from the caller's clock, not from when the loop drains the microtask.
   */
 private[microserve] class JvmRuntime extends Runtime:
   private val loop = new EventLoop

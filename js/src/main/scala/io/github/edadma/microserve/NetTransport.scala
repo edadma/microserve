@@ -60,7 +60,7 @@ private[microserve] class NetServerTransport extends ServerTransport:
     // (e.g. EADDRINUSE), so the listener must already be attached when the
     // event fires on the next tick.
     server.on("error", { (err: js.Any) =>
-      onError(new RuntimeException(s"listen failed: $err"))
+      onError(translateBindError(err))
     })
     server.listen(
       port,
@@ -78,6 +78,25 @@ private[microserve] class NetServerTransport extends ServerTransport:
     if server != null then
       server.close(() => ())
       server = null
+
+  /** Map Node `Error` objects to the cross-platform [[BindError]] taxonomy.
+    * Node attaches a stable POSIX-style `code` string to errno errors —
+    * far more reliable than parsing the message text. Wrap the original
+    * error as a `RuntimeException` so it can ride along as `cause`.
+    */
+  private def translateBindError(err: js.Any): BindError =
+    val cause = new RuntimeException(s"listen failed: $err")
+    val codeOpt =
+      try
+        val d = err.asInstanceOf[js.Dynamic]
+        if js.typeOf(d.code) == "string" then Some(d.code.asInstanceOf[String]) else None
+      catch case _: Throwable => None
+    codeOpt match
+      case Some("EADDRINUSE")    => BindError.AddressInUse(cause)
+      case Some("EACCES")        => BindError.PermissionDenied(cause)
+      case Some("ENOTFOUND")     => BindError.InvalidHost(cause)
+      case Some("EADDRNOTAVAIL") => BindError.InvalidHost(cause)
+      case _                     => BindError.Other(cause)
 end NetServerTransport
 
 /** Wraps a single `net.Socket`. Node delivers `data` events as Buffers

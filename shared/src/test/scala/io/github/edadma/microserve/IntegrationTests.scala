@@ -381,11 +381,159 @@ class IntegrationTests extends AsyncFreeSpec with Matchers:
         second.close()
         drained.future.transform { _ =>
           result.map {
-            case Right(_) => succeed
+            case Right(e: BindError.AddressInUse) => succeed
+            case Right(other) =>
+              fail(s"expected BindError.AddressInUse, got ${other.getClass.getSimpleName}: ${other.getMessage}")
             case Left(msg) => fail(msg)
           }
         }
       }
+    }
+  }
+
+  // -- bindWithRetry ---------------------------------------------------------
+  // The Server.bindWithRetry helper should climb past a busy start port, call
+  // onPortBumped for each skipped one, and ultimately bind on the first free
+  // port. Replaces juicer's hand-rolled message-grep retry.
+
+  "Server.bindWithRetry climbs past a busy port to the next free one" in {
+    val busyPort = basePort + 19
+    val firstReady = Promise[Unit]()
+    val first = createServer { (_, res) => res.send("squat") }
+    first.listen(busyPort, "127.0.0.1") { () => firstReady.success(()) }
+
+    firstReady.future.flatMap { _ =>
+      val bumps = scala.collection.mutable.ArrayBuffer.empty[(Int, Int)]
+      val bound = Promise[(Server, Int)]()
+      val errored = Promise[BindError]()
+
+      Server.bindWithRetry({ (_, res) => res.send("retry-server") })(
+        startPort    = busyPort,
+        host         = "127.0.0.1",
+        retries      = 5,
+        onPortBumped = (busy, next) => bumps += ((busy, next)),
+      )(
+        onBound = (s, p) => bound.success((s, p)),
+        onError = e => errored.trySuccess(e),
+      )
+
+      val timers = summon[Runtime].timers
+      val timeout = Promise[Throwable]()
+      val _ = timers.setTimeout(5000)(() =>
+        timeout.trySuccess(new RuntimeException("bindWithRetry didn't resolve within 5s")),
+      )
+
+      val race = Future.firstCompletedOf(Seq(
+        bound.future.map(Right(_)),
+        errored.future.map(e => Left(s"unexpected onError: ${e.getClass.getSimpleName}")),
+        timeout.future.map(t => Left(t.getMessage)),
+      ))
+
+      race.transformWith { result =>
+        val drained = Promise[Unit]()
+        first.close(() => drained.success(()))
+        bound.future.value.flatMap(_.toOption).foreach(_._1.close())
+        drained.future.transform { _ =>
+          result.map {
+            case Right((_, p)) =>
+              p should be > busyPort
+              bumps should not be empty
+              bumps.head._1 shouldBe busyPort
+              succeed
+            case Left(msg) => fail(msg)
+          }
+        }
+      }
+    }
+  }
+
+  // -- actualPort with ephemeral binding -------------------------------------
+  // Binding to port 0 asks the kernel to pick a free port; `actualPort` must
+  // report what the kernel chose, not the requested 0. This used to be Native-
+  // -only-broken (libuv didn't expose getsockname through spritzsn/libuv);
+  // 0.0.33 added `getSockNameWithPort` so all three transports now support it.
+
+  "binding to port 0 reports the actual ephemeral port via actualPort" in {
+    val ready = Promise[Unit]()
+    val errored = Promise[Throwable]()
+    val server = createServer { (_, res) => res.send("ok") }
+    server.listen(0, "127.0.0.1")(
+      onListening = () => ready.success(()),
+      onError     = e => errored.trySuccess(e),
+    )
+    Future.firstCompletedOf(Seq(
+      ready.future.map(_ => Right(())),
+      errored.future.map(e => Left(e.getMessage)),
+    )).flatMap {
+      case Right(_) =>
+        val chosen = server.actualPort
+        val drained = Promise[Unit]()
+        server.close(() => drained.success(()))
+        drained.future.map { _ =>
+          chosen should be > 0
+          chosen should not be 0
+        }
+      case Left(msg) =>
+        val drained = Promise[Unit]()
+        server.close(() => drained.success(()))
+        drained.future.transform { _ => scala.util.Success(fail(s"port-0 bind failed: $msg")) }
+    }
+  }
+
+  // -- configurable idle timeout ---------------------------------------------
+  // ConnectionState's idle-timeout used to be hardcoded at 30s. Verify the
+  // listen-time override actually closes a half-open keep-alive promptly.
+
+  "idleTimeoutMs closes a connection that sends no bytes within the window" in {
+    // bindWithRetry above climbs from basePort+19 → +20, so use a port outside
+    // its retry window. Always wire onError so a bind failure surfaces as a
+    // test failure instead of a silent hang.
+    val port = basePort + 25
+    val server = createServer { (_, res) => res.send("ok") }
+    val listening = Promise[Unit]()
+    val bindFailed = Promise[Throwable]()
+    server.listen(port, "127.0.0.1", idleTimeoutMs = 200L)(
+      onListening = () => listening.success(()),
+      onError     = e => bindFailed.trySuccess(e),
+    )
+
+    Future.firstCompletedOf(Seq(
+      listening.future.map(_ => Right(())),
+      bindFailed.future.map(e => Left(e.getMessage)),
+    )).flatMap {
+      case Left(msg) =>
+        val drained = Promise[Unit]()
+        server.close(() => drained.success(()))
+        drained.future.transform { _ => scala.util.Success(fail(s"bind failed: $msg")) }
+      case Right(_) =>
+        val runtime = summon[Runtime]
+        runtime.connect("127.0.0.1", port).flatMap { conn =>
+          val closed = Promise[Unit]()
+          conn.onRead(_ => ())
+          conn.onClose(() => closed.trySuccess(()))
+
+          // Don't write anything — let the server's idle timeout fire. Allow
+          // some slack on top of the 200ms window for scheduler jitter.
+          val timers = runtime.timers
+          val timeout = Promise[Boolean]()
+          val _ = timers.setTimeout(2000)(() => timeout.trySuccess(false))
+
+          val race = Future.firstCompletedOf(Seq(
+            closed.future.map(_ => true),
+            timeout.future,
+          ))
+
+          race.transformWith { result =>
+            val drained = Promise[Unit]()
+            server.close(() => drained.success(()))
+            conn.close()
+            drained.future.transform { _ =>
+              result.map { closedQuickly =>
+                closedQuickly shouldBe true
+              }
+            }
+          }
+        }
     }
   }
 

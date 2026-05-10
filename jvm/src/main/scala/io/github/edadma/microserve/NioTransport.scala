@@ -1,6 +1,6 @@
 package io.github.edadma.microserve
 
-import java.net.{InetSocketAddress, StandardSocketOptions}
+import java.net.{BindException, InetSocketAddress, StandardSocketOptions, UnknownHostException}
 import java.nio.ByteBuffer
 import java.nio.channels.{SelectionKey, ServerSocketChannel, SocketChannel}
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -14,6 +14,12 @@ private[microserve] class NioServerTransport(loop: EventLoop) extends ServerTran
   private val channel = ServerSocketChannel.open()
   private var key: SelectionKey = null
   private var acceptHandler: ConnectionTransport => Unit = _ => ()
+  // Tracks whether a successful `listen` ever took an `loop.ref()`. `close()`
+  // must NOT call `loop.unref()` if the listen failed — doing so drops the
+  // loop's ref-count below the level the rest of the system expects (tests
+  // observed: phantom ref of 1 → 0 → daemon thread exits → every subsequent
+  // listen/connect hangs because nothing pumps microtasks).
+  private var listened = false
 
   def actualPort: Int = channel.socket().getLocalPort
 
@@ -29,6 +35,7 @@ private[microserve] class NioServerTransport(loop: EventLoop) extends ServerTran
       channel.bind(new InetSocketAddress(host, port))
       key = loop.register(channel, SelectionKey.OP_ACCEPT, new AcceptHandler)
       loop.ref()
+      listened = true
       loop.nextTick(onListening)
     catch
       case e: Exception =>
@@ -36,7 +43,25 @@ private[microserve] class NioServerTransport(loop: EventLoop) extends ServerTran
         // error on the loop so the user sees it from the same thread that
         // would have called `onListening`.
         try channel.close() catch case _: Exception => ()
-        loop.nextTick(() => onError(e))
+        loop.nextTick(() => onError(translateBindError(e)))
+
+  /** Map JVM bind exceptions to the cross-platform [[BindError]] taxonomy.
+    * `BindException`'s detail message is locale-dependent on Linux but stable
+    * enough on the OSes we ship for ("Address already in use", "Permission
+    * denied"). When it doesn't match, fall through to `Other` rather than
+    * guess.
+    */
+  private def translateBindError(e: Throwable): BindError = e match
+    case _: UnknownHostException                                     => BindError.InvalidHost(e)
+    case _: java.nio.channels.UnresolvedAddressException             => BindError.InvalidHost(e)
+    case _: SecurityException                                        => BindError.PermissionDenied(e)
+    case b: BindException                                            =>
+      val m = if b.getMessage != null then b.getMessage.toLowerCase else ""
+      if m.contains("address already in use") then BindError.AddressInUse(b)
+      else if m.contains("permission denied")  then BindError.PermissionDenied(b)
+      else BindError.Other(b)
+    case _: IllegalArgumentException                                 => BindError.InvalidHost(e)
+    case _                                                           => BindError.Other(e)
 
   def close(): Unit =
     if key != null then
@@ -44,7 +69,9 @@ private[microserve] class NioServerTransport(loop: EventLoop) extends ServerTran
       key = null
     try channel.close()
     catch case _: Exception => ()
-    loop.unref()
+    if listened then
+      loop.unref()
+      listened = false
 
   private class AcceptHandler extends SelectionKeyHandler:
     def handle(k: SelectionKey): Unit =

@@ -19,6 +19,9 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
   private var _closing = false
   private var _onDrain: Option[() => Unit] = None
   private var _listening = false
+  // Updated by `listen` before any connections can arrive; ConnectionState
+  // reads this when constructing its idle-timeout. 30s matches Node's default.
+  private var _idleTimeoutMs: Long = 30000L
 
   // Each accepted ConnectionTransport spawns a ConnectionState; teardown is
   // observed via ConnectionState's own close hook so we can drain accurately.
@@ -29,6 +32,7 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
       timers = timers,
       onConnectionClosed = onConnectionClosed,
       isServerClosing = () => _closing,
+      idleTimeoutMs = _idleTimeoutMs,
     )
     connections += state
   }
@@ -43,25 +47,27 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
     * server is unusable; construct a fresh one if you want to retry on a
     * different port.
     *
+    * `idleTimeoutMs` controls how long an established keep-alive connection
+    * may sit idle (no bytes either way) before microserve closes it. Defaults
+    * to 30s, matching Node's `server.keepAliveTimeout`/`headersTimeout`. Long-
+    * polling endpoints whose wait window approaches the timeout should either
+    * raise this value or shorten their wait so the server doesn't kill the
+    * socket out from under them.
+    *
     * Calling more than once is undefined behaviour (matches Node.js).
     */
-  def listen(port: Int, host: String = "0.0.0.0")(
+  def listen(port: Int, host: String = "0.0.0.0", idleTimeoutMs: Long = 30000L)(
       onListening: () => Unit          = () => (),
       onError:     Throwable => Unit   = _ => (),
   ): Unit =
-    // Normalise the host string before handing it to a transport. Without
-    // this, the three platforms behave inconsistently on the same input:
-    //   - JVM NIO does DNS, picks an interface based on the socket family
-    //   - Node also does DNS, but on macOS may pick ::1 (IPv6) for
-    //     "localhost" — clients connecting to 127.0.0.1 then get
-    //     ECONNREFUSED
-    //   - libuv's `uv_ip4_addr` is a strict numeric-IPv4 parser and rejects
-    //     "localhost" with EINVAL outright
-    // Map the two common dev-server defaults to canonical IPv4 strings so
-    // every transport sees the same numeric address. Anything else passes
-    // through unchanged — for arbitrary hostnames, callers should resolve
-    // via the OS first or pass an IP literal. (A future enhancement could
-    // route through `uv_getaddrinfo` / `dns.lookup` for full resolution.)
+    _idleTimeoutMs = idleTimeoutMs
+    // Normalise the two common dev-server defaults to canonical IPv4 strings
+    // so every transport sees the same numeric address. Without this, Node on
+    // macOS picks ::1 (IPv6) for "localhost", and clients that go straight to
+    // 127.0.0.1 then get ECONNREFUSED. Arbitrary hostnames pass through to
+    // the transport, which is responsible for resolving them — JVM and Node
+    // both do DNS implicitly; the Native transport routes through libuv's
+    // `uv_getaddrinfo`.
     val resolvedHost = host.toLowerCase match
       case "localhost" => "127.0.0.1"
       case ""          => "0.0.0.0"
@@ -97,4 +103,51 @@ class Server private[microserve] (handler: RequestHandler, runtime: Runtime):
     * block here; JS returns immediately because Node owns its loop.
     */
   def run(): Unit = runtime.run()
+end Server
+
+object Server:
+
+  /** Bind a fresh server starting at `startPort`, climbing one port at a time
+    * if the bind fails with [[BindError.AddressInUse]]. Calls `onBound` with
+    * the successfully-bound server (and the actual port chosen). Calls
+    * `onError` only when the failure is *not* a port conflict, or when the
+    * retry budget is exhausted.
+    *
+    * `onPortBumped(busyPort, nextPort)` fires once per skipped port so dev
+    * tools can log "port N is in use; trying N+1…" without having to hook
+    * the inner retry loop themselves. Default is a no-op.
+    *
+    * Each retry constructs a fresh [[Server]] (and a fresh transport):
+    * microserve's transports are one-shot — once the underlying socket has
+    * failed to bind, the bookkeeping is unsafe to reuse.
+    */
+  def bindWithRetry(handler: RequestHandler)(
+      startPort:     Int,
+      host:          String        = "0.0.0.0",
+      retries:       Int           = 20,
+      idleTimeoutMs: Long          = 30000L,
+      onPortBumped:  (Int, Int) => Unit = (_, _) => (),
+  )(
+      onBound: (Server, Int) => Unit,
+      onError: BindError => Unit          = _ => (),
+  )(using runtime: Runtime): Unit =
+    def attempt(port: Int, remaining: Int): Unit =
+      val server = new Server(handler, runtime)
+      server.listen(port, host, idleTimeoutMs)(
+        onListening = () => onBound(server, server.actualPort),
+        onError = {
+          case _: BindError.AddressInUse if remaining > 0 =>
+            onPortBumped(port, port + 1)
+            attempt(port + 1, remaining - 1)
+          case e: BindError =>
+            onError(e)
+          case e =>
+            // Defensive: a transport that didn't translate to BindError. We
+            // wrap so the user-facing onError signature stays typed.
+            onError(BindError.Other(e))
+        },
+      )
+    attempt(startPort, retries)
+  end bindWithRetry
+
 end Server
